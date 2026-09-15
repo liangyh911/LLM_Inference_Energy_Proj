@@ -1,0 +1,25 @@
+# transformers==4.41
+transformers==4.44.2
+pandas
+numpy
+torch
+evaluate
+accelerate
+SentencePiece
+jieba
+rouge
+fuzzywuzzy
+python-Levenshtein
+protobuf
+bitsandbytes
+openai
+anthropic
+seaborn
+matplotlib
+
+# flash-attn must be installed manually AFTER torch (it needs torch at build time):
+#   pip install flash-attn --no-build-isolation
+# It is optional when using --attn_implementation sdpa or eager.
+
+# The optional MInference integration lives in requirements-minference.txt:
+#   pip install -r requirements-minference.txt

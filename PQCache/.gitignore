@@ -1,0 +1,13 @@
+__pycache__/
+data/
+pred/
+config/
+.hypothesis/
+.config/
+
+plot*
+nah_inputs.txt
+vq_method/retrieval_based/lfu/build
+vq_method/retrieval_based/lru/build
+*.jsonl
+*.json

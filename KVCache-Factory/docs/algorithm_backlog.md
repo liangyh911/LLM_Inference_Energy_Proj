@@ -1,0 +1,66 @@
+# KV Cache Algorithm Backlog
+
+Evidence date: 2026-06-23.
+
+This backlog tracks representative KV cache algorithms to keep or implement in KVCache-Factory and its nano-vllm / mini-sglang ports. GitHub star counts were checked with the GitHub API; citation counts are approximate and were checked with OpenAlex or Semantic Scholar when available.
+
+## Selection Rules
+
+- Prefer methods with high citations, high GitHub stars, or broad baseline usage.
+- Prefer mechanism diversity over near-duplicate implementations.
+- Implement first in KVCache-Factory, then port the same algorithm contract to the runtime forks.
+- Record whether a method is already implemented, partially implemented, or missing.
+
+## Current Coverage
+
+| Category | Method | Representative signal | Status |
+| --- | --- | --- | --- |
+| Compression | StreamingLLM | `mit-han-lab/streaming-llm`: 7231 stars; ICLR 2024; attention sinks baseline | Implemented; decode-time runtime policy wired in nano-vllm/mini-sglang |
+| Compression/retrieval | H2O | `FMInference/H2O`: 523 stars; NeurIPS 2023 heavy-hitter baseline | Implemented in reference repo (Hugging Face monkeypatch); decode-time block/page policies wired in nano-vllm and mini-sglang (`build_decode_h2o_block_table` / `build_decode_h2o_page_table` / `build_decode_h2o_indices`) with optional attention-history buffer and Quest-style fallback. |
+| Retrieval/compression | SnapKV | `FasterDecoding/SnapKV`: 321 stars; NeurIPS 2024; observation-window selection | Implemented in reference repo (Hugging Face monkeypatch); decode-time block/page policies wired in nano-vllm and mini-sglang (`build_decode_snapkv_block_table` / `build_decode_snapkv_page_table` / `build_decode_snapkv_indices`) with attention-history-or-fallback scoring plus 1D avgpool/maxpool denoising. |
+| Retrieval | Quest | `mit-han-lab/quest`: 396 stars on 2026-06-23; ICML 2024; query-aware sparse KV retrieval | Implemented core page/token selector; decode-time query-aware table policy wired in nano-vllm/mini-sglang |
+| Compression | NACL | ACL 2024; single-operation encoding-time eviction with proxy-token and random eviction | Implemented core proxy/random selector |
+| Compression | Scissorhands | NeurIPS 2023; persistence-of-importance eviction baseline | Implemented core persistence selector |
+| Cross-layer compression | MiniCache | NeurIPS 2024; Semantic Scholar: 85 citations; depth-dimension KV compression | Implemented core SLERP merge/restore contract |
+| Compression/budgeting | PyramidKV | `Zefan-Cai/KVCache-Factory`: 1346 stars; project core method | Implemented |
+| Adaptive compression | AdaKV | `FFY0/AdaKV`: 134 stars; NeurIPS 2025; head-adaptive budgets | Implemented |
+| Adaptive retrieval | HeadKV | Semantic Scholar: 84 citations for arXiv:2410.19258; ICLR 2025 | Implemented |
+| Retrieval/compression | L2Norm | EMNLP 2024; simple norm-based baseline | Implemented |
+| Merge | LOOK-M pivot merge | EMNLP Findings 2024; `SUSTechBruce/LOOK-M`: 103 stars | Implemented (`--merge pivot`) |
+| Merge | KVMerger-style weighted merge | OpenReview/arXiv 2024; adaptive token-level KV merging | Implemented nearest-neighbor weighted merge (`--merge weighted`) |
+| Quantization | KIVI-style HQQ cache config | `jy-yuan/KIVI`: 411 stars; ICML 2024; key per-channel/value per-token axis defaults | Implemented config path (`--quant_method kivi`) |
+| Quantization | KVQuant-style outlier path | `squeezeailab/kvquant`: 427 stars; NeurIPS 2024 | Partially implemented (`--quant_method kvquant`) |
+| Quantization | GEAR-style low-rank residual | arXiv 2024; near-lossless KV compression recipe | CPU-tested `compress_kv_gear` / `decompress_kv_gear` in nano-vllm and mini-sglang; CLI config metadata in KVCache-Factory (`--quant_method gear --rank --outlier_ratio`). Runtime cache wiring still pending. |
+| Sparse prefill | MInference | `microsoft/MInference`: 1220 stars; NeurIPS 2024 Spotlight | Partially integrated |
+| Lossless offloading | HeadInfer | `wdlctc/headinfer`; ICML 2025 (arXiv:2502.12574); head-wise CPU offloading, million-token contexts on one GPU | Implemented (`--method headinfer`, FlashAttention-2 path): head-wise cache slots with async prefetch/evict, LongBench runner + latency/memory benchmark wiring, chunked-prefill example |
+
+## Priority Candidates
+
+| Priority | Category | Method | Evidence | Implementation target |
+| --- | --- | --- | --- | --- |
+| P0 | Retrieval runtime integration | Quest hot path | `mit-han-lab/quest`: 396 stars on 2026-06-23; ICML 2024; query-aware sparse KV retrieval | Nano-vllm and mini-sglang now rebuild decode block/page tables from the current query and KV page metadata; remaining work is GPU validation and any Hugging Face hot-path parity needed in the reference repo. |
+| P1 | Merge | KVMerger parity | OpenReview/arXiv 2024; adaptive token-level KV merging | Replace the current nearest-neighbor weighted merge with the paper's full merge-set identification if needed for parity. |
+| P1 | Quantization | KIVI kernel parity | `jy-yuan/KIVI`: 411 stars; ICML 2024; asymmetric 2-bit KV quantization | Replace or augment the HQQ config path with official-kernel-equivalent packing/dequantization if needed for performance parity. |
+| P1 | Compression runtime integration | NACL hot path | ACL 2024; single-operation encoding-time eviction | Decode-time NACL block/page policy wired in nano-vllm and mini-sglang; reference repo Hugging Face prompt-time eviction wrapper still pending. |
+| P1 | Compression runtime integration | Scissorhands hot path | NeurIPS 2023; persistence-of-importance eviction baseline | Decode-time Scissorhands block/page policy wired in nano-vllm and mini-sglang (with optional caller-supplied importance buffer, Quest-style fallback, and topk/probabilistic selection); reference repo Hugging Face decode-time wrapper still pending. |
+| P1 | Cross-layer runtime integration | MiniCache hot path | NeurIPS 2024; depth-dimension KV compression | Runtime-side `MiniCachePairStore` landed in nano-vllm and mini-sglang: per-layer-pair compressed-pair storage with K-determined shared retention indices, magnitude-preserving SLERP restore, and exact round-trip on retained tokens. Hugging Face reference repo wrapper still pending. |
+| P1 | Quantization | GEAR | arXiv 2024; near-lossless KV compression recipe | CPU prototype landed: nano-vllm and mini-sglang expose `compress_kv_gear` / `decompress_kv_gear` with uniform quantization + SVD-based low-rank residual reconstruction; KVCache-Factory CLI accepts `--quant_method gear --rank --outlier_ratio`. Remaining: wire the payload into a paged cache layout and validate end-to-end loss recovery on GPU. |
+| P2 | Systems compression | CacheGen | SIGCOMM 2024; 72 OpenAlex citations; `UChi-JCL/CacheGen`: 159 stars | Track for cache serialization/streaming rather than first-pass in-model attention. |
+| P2 | Library baseline | NVIDIA kvpress | `NVIDIA/kvpress`: 1116 stars and active in 2026 | Use as an interoperability/reference baseline; do not blindly copy its API. |
+| P2 | Quantization | TurboQuant | ICLR 2026; Google Research; strong new quantization idea but low citation age | Track after KIVI/KVQuant/GEAR unless a compact reference implementation becomes mature. |
+
+## Runtime Porting Notes
+
+- KVCache-Factory can use Hugging Face monkeypatches; nano-vllm and mini-sglang need runtime-native integration.
+- Nano-vllm status: `nanovllm.kvcache_factory` now contains CPU-tested core selectors for StreamingLLM/H2O/SnapKV/Quest/NACL/Scissorhands, MiniCache cross-layer merge/restore utilities, nearest-token merge for LOOK-M/KVMerger-style modes, KIVI/KVQuant/GEAR config metadata (with `compress_kv_gear`/`decompress_kv_gear`), and decode-time block-table policies for StreamingLLM, Quest, NACL, Scissorhands, and H2O (`build_decode_h2o_block_table`) plus a runtime-side `MiniCachePairStore` for adjacent-layer compressed-pair storage with shared K-determined retention.
+- Mini-sglang status: `minisgl.kvcache_factory` now contains the matching CPU-tested core selectors for StreamingLLM/H2O/SnapKV/Quest/NACL/Scissorhands, MiniCache cross-layer merge/restore utilities, nearest-token merge, KIVI/KVQuant/GEAR config metadata (with `compress_kv_gear`/`decompress_kv_gear`), and decode-time policies for StreamingLLM, Quest, NACL, Scissorhands, and H2O (`build_decode_h2o_page_table` / `build_decode_h2o_indices`) for FA/FI/TRTLLM backends, plus a runtime-side `MiniCachePairStore` mirroring the nano-vllm contract.
+- For nano-vllm, preserve block-table and cache allocation invariants before pruning or merging tokens.
+- For mini-sglang, preserve prefix-sharing/radix-cache semantics before modifying cache contents.
+- StreamingLLM runtime caveat: nano-vllm retention is rounded to full KV blocks because its default paged cache uses 256-token blocks; mini-sglang is token-exact when `page_size=1`.
+- Quest runtime caveat: both runtime forks reduce per-head Quest page scores to one sequence-level block/page table because their paged-attention kernels accept one table per request. Nano-vllm is block-rounded; mini-sglang is token-exact with `page_size=1`.
+- NACL runtime caveat: paper-NACL is encoding-time. The runtime forks expose decode-time NACL policies that use the current query as the proxy and Quest-style page-min/max metadata as the score, then apply NACL's protected-sink/recent + top-K + random selection at the page level. Nano-vllm is block-rounded; mini-sglang is token-exact with `page_size=1`. Deterministic random sampling requires the caller to pass a `torch.Generator` with a fixed seed.
+- Scissorhands runtime caveat: the paper accumulates per-token persistence-of-importance across decode steps. Runtime callers may pass an `importance` buffer (`[total_pages]` or `[kv_heads, total_pages]` per sequence) which is reduced across heads and used directly. If none is supplied the policy falls back to a single-step Quest-style query-vs-page-extreme score so the API is usable standalone. `selection="prob"` samples by softmax-of-importance with optional `random_temperature` and a `torch.Generator` for determinism.
+- MiniCache runtime caveat: the paper folds adjacent layers' KV via SLERP direction sharing with per-layer magnitudes and high-angular-distance retention. The runtime `MiniCachePairStore` stores compressed pairs keyed by `(current_layer_idx, previous_layer_idx)`. K's angular distance defines retention indices and V re-uses the same positions, so retained tokens round-trip exactly while merged tokens preserve per-token magnitude via the shared direction. Same-layer pairs are rejected; the store exposes `has_pair`, `restore_pair`, `retention_indices`, `clear_pair`, and `clear`.
+- H2O runtime caveat: the paper accumulates per-token attention sums across decode steps and retains heavy hitters plus a recent window. Runtime callers may pass an `attention_history` buffer (`[total_pages]` or `[kv_heads, total_pages]` per sequence); without it the policy falls back to a single-step Quest-style query-vs-page-extreme score (same fallback as Scissorhands). No sink, no random sampling, no probabilistic mode — H2O is always deterministic top-K-by-history + recent.
+- SnapKV runtime caveat: identical scoring surface to H2O (optional `attention_history` per sequence, Quest-style fallback) but applies a 1D pool (`avgpool` with `count_include_pad=False`, or `maxpool`) of configurable `kernel_size` across the per-page score vector before top-K. This denoises neighbor pages: a single high-importance spike pulls its neighbors above isolated low-score pages, matching the paper's observation-window pooling intuition at the page granularity.
+- Every method needs at least synthetic shape/budget tests in all target repos before GPU benchmarking.
