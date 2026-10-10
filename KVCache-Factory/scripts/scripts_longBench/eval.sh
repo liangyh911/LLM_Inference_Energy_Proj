@@ -1,8 +1,8 @@
 export CUDA_VISIBLE_DEVICES=0
 
-method="SnapKV" # Support PyramidKV, SnapKV, H2O, StreamingLLM, CAM, L2Norm, ThinK, HeadKV, default FullKV
-max_capacity_prompts=64 # 128,2048 in paper
-attn_implementation="sdpa" # Support "flash_attention_2", "sdpa", "eager".
+method="PyramidKV" # Support PyramidKV, SnapKV, H2O, StreamingLLM, CAM, L2Norm, ThinK, HeadKV, default FullKV
+max_capacity_prompts=4096 # 128,2048 in paper
+attn_implementation="flash_attention_2" # Support "flash_attention_2", "sdpa", "eager".
 source_path="./Results/"
 model_path="meta-llama/Meta-Llama-3-8B-Instruct"
 merge_method="pivot" # Support "pivot"(LOOK-M_PivotMerge).
@@ -21,7 +21,7 @@ if [ -n "${quant_method}" ] && [ "${quant_method}" != "none" ] && [ "${quant_met
     fi
 fi
 
-python3 run_longbench_time.py \
+python3 run_longbench_energy.py \
     --method ${method} \
     --model_path ${model_path} \
     --max_capacity_prompts ${max_capacity_prompts} \
@@ -29,5 +29,6 @@ python3 run_longbench_time.py \
     --save_dir ${save_dir} \
     --eval_batch_size 8 \
     --dtype bfloat16 \
+    --enable_power_monitor "True" \
     --kv_cache_granularity kv_head
     # "${extra_args[@]}"

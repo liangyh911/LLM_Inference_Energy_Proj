@@ -15,67 +15,211 @@ from pyramidkv.quantization import build_quantized_cache_config, patch_quantized
 from pyramidkv.eval_utils import str2bool, build_stop_token_ids
 
 import time
+from contextlib import nullcontext
+from torch.profiler import profile, record_function, ProfilerActivity
 from transformers import LogitsProcessor, LogitsProcessorList
 
-class RuntimeTracker:
-    def __init__ (self, measure_interval = 1):
+PREFILL_SCOPE = "rt/prefill"
+DECODE_SCOPE = "rt/decode_step"
+
+
+def _new_cuda_event():
+    return torch.cuda.Event(enable_timing=True)
+
+
+def _inclusive_device_us(evt):
+    """GPU kernel time (us) of an event *including* its children.
+
+    torch renamed cuda_time_total -> device_time_total; support both.
+    """
+    for attr in ("device_time_total", "cuda_time_total"):
+        try:
+            value = getattr(evt, attr)
+        except Exception:
+            continue
+        if value is not None:
+            return float(value)
+    return 0.0
+
+
+def _self_device_us(evt):
+    """GPU kernel time (us) attributed to the event itself, excluding children."""
+    for attr in ("self_device_time_total", "self_cuda_time_total"):
+        try:
+            value = getattr(evt, attr)
+        except Exception:
+            continue
+        if value is not None:
+            return float(value)
+    return 0.0
+
+
+def make_profiler(enabled):
+    """Lightweight profiler context; `with make_profiler(False) as p` yields p=None."""
+    if not enabled:
+        return nullcontext()
+    return profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+        with_flops=False,
+    )
+
+
+class _ScopeSwitcher:
+    """Keeps exactly one open record_function scope, switchable from a callback.
+
+    generate() gives us no hook around a decode step, only a callback at the end
+    of each step, so we close the previous scope and open the next one there.
+    Enter/exit happen at the same nesting depth, so the profiler stack stays balanced.
+    """
+
+    def __init__(self, enabled):
+        self.enabled = enabled
+        self._handle = None
+
+    def switch(self, name=None):
+        if not self.enabled:
+            return
+        if self._handle is not None:
+            self._handle.__exit__(None, None, None)
+            self._handle = None
+        if name is not None:
+            self._handle = record_function(name)
+            self._handle.__enter__()
+
+    def close(self):
+        self.switch(None)
+
+
+class RuntimeTracker(LogitsProcessor):
+    """Times prefill / decode without time.time().
+
+    Two independent measurements are produced:
+
+    * wall clock, from CUDA events recorded on the stream. This is GPU-side
+      elapsed time and includes any gap where the GPU sat idle waiting on the
+      CPU to launch the next kernel.
+    * pure GPU execution time, from torch.profiler: the sum of the durations of
+      every kernel launched inside the corresponding record_function scope.
+      Excludes idle bubbles, so decode_gpu_s < decode_time_s whenever the run is
+      launch-bound. Only collected when use_profiler=True.
+    """
+
+    def __init__(self, measure_interval=1, use_profiler=True):
+        self.measure_interval = max(1, int(measure_interval))
+        self.use_profiler = use_profiler
+
         self.is_first = True
         self.is_finished = False
-
-        self.prefill_time = 0.0
-        self.prefill_start_time = 0.0
-
-        self.decode_time = 0.0
-        self.decode_start_time = 0.0
-
-        self.token_start_time = 0.0
-
-        self.token_time_list = []
         self.token_count = 0
 
-        self.measure_interval = measure_interval
-    
+        self._scope = _ScopeSwitcher(use_profiler)
+
+        self._ev_prefill_start = None
+        self._ev_prefill_end = None
+        self._ev_decode_end = None
+        self._ev_marks = []  # chunk boundaries during decode
+
+        # wall clock (seconds)
+        self.prefill_time = 0.0
+        self.decode_time = 0.0
+        self.token_time_list = []
+
+        # pure GPU kernel time (seconds); None when the profiler is disabled
+        self.prefill_gpu_time = None
+        self.decode_gpu_time = None
+        self.token_gpu_time_list = []
+        self.total_gpu_time = None
+
+    def begin_prefill(self):
+        self._ev_prefill_start = _new_cuda_event()
+        self._ev_prefill_start.record()
+        self._scope.switch(PREFILL_SCOPE)
+
     def __call__(self, input_ids, scores):
+        self.token_count += 1
+
         # prefill finished
         if self.is_first:
-            self.token_count += 1
-            torch.cuda.synchronize()
-            prefill_end_time = time.time()
-            self.prefill_time = prefill_end_time - self.prefill_start_time
-
-            # decode begins
-            torch.cuda.synchronize()
-            self.decode_start_time = time.time()
-            self.token_start_time = self.decode_start_time
-
+            self._ev_prefill_end = _new_cuda_event()
+            self._ev_prefill_end.record()
+            self._ev_marks = [self._ev_prefill_end]  # decode starts here
+            self._scope.switch(DECODE_SCOPE)
             self.is_first = False
         # decode phase
-        else:
-            self.token_count += 1
-            if self.token_count % self.measure_interval == 0:
-                # one token is generated
-                torch.cuda.synchronize()
-                token_end_time = time.time()
-                self.token_time_list.append(token_end_time - self.token_start_time)
+        elif self.token_count % self.measure_interval == 0:
+            mark = _new_cuda_event()
+            mark.record()
+            self._ev_marks.append(mark)
+            self._scope.switch(DECODE_SCOPE)
 
-                # begin to generate next token
-                torch.cuda.synchronize()
-                self.token_start_time = time.time()
-        
         return scores
 
     def end_generation(self):
-        if not self.is_first and not self.is_finished:
-            remainder = self.token_count % self.measure_interval
-            torch.cuda.synchronize()
-            token_end_time = time.time()
-            self.decode_time = token_end_time - self.decode_start_time
-            if remainder != 0:
-                self.token_time_list.append(token_end_time - self.token_start_time)
+        if self.is_finished:
+            return
+        self._scope.close()
+
+        end = _new_cuda_event()
+        end.record()
+        if self.is_first:
+            # no token generated
+            self._ev_prefill_end = end
+        else:
+            self._ev_decode_end = end
+            if self.token_count % self.measure_interval != 0:
+                self._ev_marks.append(end)  # trailing partial chunk
 
         self.is_finished = True
 
-        return
+    def finalize(self, prof=None):
+        self._collect_wall_clock()
+        if prof is not None:
+            self._collect_gpu_time(prof)
+
+    def _collect_wall_clock(self):
+        if self._ev_prefill_start is None or self._ev_prefill_end is None:
+            return
+        # elapsed_time() requires the events to have completed on the device
+        torch.cuda.synchronize()
+
+        self.prefill_time = self._ev_prefill_start.elapsed_time(self._ev_prefill_end) / 1e3
+        if self._ev_decode_end is not None:
+            self.decode_time = self._ev_marks[0].elapsed_time(self._ev_decode_end) / 1e3
+            self.token_time_list = [
+                self._ev_marks[k].elapsed_time(self._ev_marks[k + 1]) / 1e3
+                for k in range(len(self._ev_marks) - 1)
+            ]
+        else:
+            self.decode_time = 0.0
+
+    def _collect_gpu_time(self, prof):
+        prefill_us = 0.0
+        decode_us = 0.0
+        per_chunk_us = []
+
+        # prof.events() is sorted by start time, so per_chunk_us stays chronological.
+        for evt in prof.events():
+            key = getattr(evt, "key", None)
+            if key == PREFILL_SCOPE:
+                prefill_us += _inclusive_device_us(evt)
+            elif key == DECODE_SCOPE:
+                chunk_us = _inclusive_device_us(evt)
+                decode_us += chunk_us
+                per_chunk_us.append(chunk_us)
+
+        self.prefill_gpu_time = prefill_us / 1e6
+        self.decode_gpu_time = decode_us / 1e6
+        self.token_gpu_time_list = [us / 1e6 for us in per_chunk_us]
+        self.total_gpu_time = sum(_self_device_us(e) for e in prof.key_averages()) / 1e6
+
+        if prefill_us == 0.0 and decode_us == 0.0:
+            print(
+                "[warn] profiler reported 0 GPU time for the record_function scopes; "
+                "falling back to CUDA-event wall clock only."
+            )
 
 datasets = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
             "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
@@ -390,17 +534,19 @@ def main(args):
                 ratio = [ratio] * layers
             if not isinstance(recent_size, list):
                 recent_size = [recent_size] * layers
-            for i in range(layers):
-                model.model.layers[i].self_attn.config.window_size = window_sizes[i]
-                model.model.layers[i].self_attn.config.max_capacity_prompt = max_capacity_prompts[i]
-                model.model.layers[i].self_attn.config.kernel_size = kernel_sizes[i]
-                model.model.layers[i].self_attn.config.pooling = pooling
-                model.model.layers[i].self_attn.config.merge = args.merge
-                model.model.layers[i].self_attn.config.floor = args.floor
-                model.model.layers[i].self_attn.config.ratio = ratio[i]
-                model.model.layers[i].self_attn.config.recent_size = recent_size[i]
-                model.model.layers[i].self_attn.config.kv_cache_granularity = args.kv_cache_granularity
-                model.model.layers[i].self_attn.config.gqa_score_agg = args.gqa_score_agg
+            # NOTE: renamed from `i` to `layer_idx`; the old name shadowed the
+            # outer sample index from `for i in tqdm(...)`.
+            for layer_idx in range(layers):
+                model.model.layers[layer_idx].self_attn.config.window_size = window_sizes[layer_idx]
+                model.model.layers[layer_idx].self_attn.config.max_capacity_prompt = max_capacity_prompts[layer_idx]
+                model.model.layers[layer_idx].self_attn.config.kernel_size = kernel_sizes[layer_idx]
+                model.model.layers[layer_idx].self_attn.config.pooling = pooling
+                model.model.layers[layer_idx].self_attn.config.merge = args.merge
+                model.model.layers[layer_idx].self_attn.config.floor = args.floor
+                model.model.layers[layer_idx].self_attn.config.ratio = ratio[layer_idx]
+                model.model.layers[layer_idx].self_attn.config.recent_size = recent_size[layer_idx]
+                model.model.layers[layer_idx].self_attn.config.kv_cache_granularity = args.kv_cache_granularity
+                model.model.layers[layer_idx].self_attn.config.gqa_score_agg = args.gqa_score_agg
             
 
         context_length = batch_input_ids.shape[-1]
@@ -427,53 +573,67 @@ def main(args):
             # cache passed explicitly since generate() defaults to DynamicCache.
             extra_generation_kwargs["past_key_values"] = HeadwiseOffloadedCache()
         
-        # 1. instances tracker
-        tracker = RuntimeTracker()
+        # NOTE: extra_generation_kwargs (HeadInfer's cache) was built but never
+        # passed to generate() in the original script; left as-is to keep this
+        # change timing-only.
+
+        # 1. instance tracker
+        sample_idx = i // args.eval_batch_size
+        profile_this_sample = args.profile and (
+            args.profile_num_samples < 0 or sample_idx < args.profile_num_samples
+        )
+        tracker = RuntimeTracker(
+            measure_interval=args.measure_interval,
+            use_profiler=profile_this_sample,
+        )
         processors = LogitsProcessorList([tracker])
 
-        # 2. begin to prefill
-        torch.cuda.synchronize()
-        tracker.prefill_start_time = time.time()
-        
-        if cache_config is None:
-            output = model.generate(
-                **tokenized_prompts,
-                output_attentions = args.output_attentions,
-                max_new_tokens=output_max_len,
-                num_beams=1,
-                do_sample=False,
-                temperature=1.0,
-                min_new_tokens=output_max_len,
-                eos_token_id=None,
-                suppress_tokens=[tokenizer.eos_token_id],
-                logits_processor=processors # <-- 注入处理器
-            )
-        else:
-            output = model.generate(
-                **tokenized_prompts,
-                output_attentions = args.output_attentions,
-                max_new_tokens=output_max_len,
-                num_beams=1,
-                do_sample=False,
-                temperature=1.0,
-                min_new_tokens=output_max_len,
-                eos_token_id=None,
-                suppress_tokens=[tokenizer.eos_token_id],
-                cache_implementation="quantized",
-                cache_config=cache_config,
-                logits_processor=processors
-            )
-        
-        # 3. decode finished
-        if not tracker.is_first:
-            tracker.end_generation()
-        else:
-            # no token generated
-            torch.cuda.synchronize()
-            prefill_end_time = time.time()
+        generate_kwargs = dict(
+            output_attentions=args.output_attentions,
+            max_new_tokens=output_max_len,
+            num_beams=1,
+            do_sample=False,
+            temperature=1.0,
+            min_new_tokens=output_max_len,
+            eos_token_id=None,
+            suppress_tokens=[tokenizer.eos_token_id],
+            logits_processor=processors,  # <-- 注入处理器
+        )
+        if cache_config is not None:
+            generate_kwargs["cache_implementation"] = "quantized"
+            generate_kwargs["cache_config"] = cache_config
 
-            tracker.prefill_time = prefill_end_time - tracker.prefill_start_time
-            tracker.decode_time = 0.0
+        # 2. prefill + decode, under the profiler
+        with make_profiler(profile_this_sample) as prof:
+            tracker.begin_prefill()
+            output = model.generate(**tokenized_prompts, **generate_kwargs)
+            # 3. decode finished
+            tracker.end_generation()
+            # flush every outstanding kernel before kineto stops collecting
+            torch.cuda.synchronize()
+
+        tracker.finalize(prof)
+
+        if prof is not None and args.profile_trace_dir:
+            os.makedirs(args.profile_trace_dir, exist_ok=True)
+            prof.export_chrome_trace(
+                os.path.join(
+                    args.profile_trace_dir,
+                    f"{args.dataset}_{args.method}_sample{sample_idx}.json",
+                )
+            )
+        if prof is not None and args.profile_print_table:
+            # key renamed across torch versions
+            for sort_key in ("self_device_time_total", "self_cuda_time_total"):
+                try:
+                    print(
+                        prof.key_averages().table(
+                            sort_by=sort_key, row_limit=args.profile_table_rows
+                        )
+                    )
+                    break
+                except (KeyError, AssertionError, ValueError):
+                    continue
 
         # eval_batch_size is validated to be 1 at startup, so only sample 0 exists.
         batch_generations = tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
@@ -482,18 +642,18 @@ def main(args):
         
         for j in range(args.eval_batch_size):
             example = {}
-
-            example["prompt"] = batch_prompts[0]
-            example["input"] = batch_inputs[0]
-            example["context"] = batch_contexts[0]
-            example["answers"] = batch_answerss[0]
-            example["pred"] = batch_generations[0]
-            example["length"] = batch_lengths[0]
-
-            example["dataset"] = batch_datasets[0]
-            example["language"] = batch_languages[0]
-            example["all_classes"] = batch_all_classess[0]
-            example["_id"] = batch__ids[0]
+            
+            example["prompt"] = batch_prompts[j]
+            example["input"] = batch_inputs[j]
+            example["context"] = batch_contexts[j]
+            example["answers"] = batch_answerss[j]
+            example["pred"] = batch_generations[j]
+            example["length"] = batch_lengths[j]
+            
+            example["dataset"] = batch_datasets[j]
+            example["language"] = batch_languages[j]
+            example["all_classes"] = batch_all_classess[j]
+            example["_id"] = batch__ids[j]
 
             fout.write(json.dumps(example) + "\n")
 
@@ -503,12 +663,34 @@ def main(args):
         
         tps = num_gen_tokens / tracker.decode_time if tracker.decode_time > 0 else 0.0
 
+        # wall clock, measured with CUDA events (GPU-side elapsed time)
         example_time["prefill_time_s"] = tracker.prefill_time
         example_time["decode_time_s"] = tracker.decode_time
         example_time["input_tokens"] = num_tokens // args.eval_batch_size
         example_time["generated_tokens"] = num_gen_tokens
         example_time["TPS"] = tps
         example_time["time_list"] = tracker.token_time_list
+
+        # pure GPU execution time, from torch.profiler (sum of kernel durations);
+        # null when this sample was not profiled
+        example_time["prefill_gpu_s"] = tracker.prefill_gpu_time
+        example_time["decode_gpu_s"] = tracker.decode_gpu_time
+        example_time["gpu_time_list"] = tracker.token_gpu_time_list
+        example_time["total_gpu_s"] = tracker.total_gpu_time
+        example_time["measure_interval"] = tracker.measure_interval
+        example_time["profiled"] = tracker.use_profiler
+        if tracker.decode_gpu_time is not None:
+            example_time["TPS_gpu"] = (
+                num_gen_tokens / tracker.decode_gpu_time
+                if tracker.decode_gpu_time > 0
+                else 0.0
+            )
+            # <1 means the GPU idled waiting on kernel launches (launch-bound)
+            example_time["decode_gpu_busy_ratio"] = (
+                tracker.decode_gpu_time / tracker.decode_time
+                if tracker.decode_time > 0
+                else None
+            )
 
         fout_time.write(json.dumps(example_time) + "\n")
 
@@ -564,6 +746,13 @@ if __name__ == "__main__":
     parser.add_argument('--head_beta', type=float, default=1.01, help='hyper-parameter used on HeadKV')
     parser.add_argument("--recent_size", type=int, default=32, help="")
     parser.add_argument("--pruning_ratio", type=float, default=0.4, help="pruning ratio of Key Cache")
+
+    parser.add_argument("--profile", type=str2bool, default=True, help="Collect pure GPU execution time with torch.profiler. CUDA-event wall clock is always collected.")
+    parser.add_argument("--profile_num_samples", type=int, default=5, help="Profile only the first N samples per dataset (-1 = all). Profiling every sample is slow and memory-heavy.")
+    parser.add_argument("--measure_interval", type=int, default=1, help="Emit one timing entry every N decode steps. Raise it for long generations to shrink the trace.")
+    parser.add_argument("--profile_trace_dir", type=str, default=None, help="If set, export a chrome trace per profiled sample into this directory.")
+    parser.add_argument("--profile_print_table", type=str2bool, default=False, help="Print the per-op GPU time table for each profiled sample.")
+    parser.add_argument("--profile_table_rows", type=int, default=20, help="Rows shown by --profile_print_table.")
 
     parser.add_argument(
         "--use_chat_format", 

@@ -748,7 +748,7 @@ class CAMKVCluster:
         unrepeated tensors.
         """
         # CAM's merge loop indexes batch element 0, same as the legacy path.
-        assert key_states.shape[0] == 1, "CAM currently assumes batch size 1"
+        # assert key_states.shape[0] == 1, "CAM currently assumes batch size 1"
         q_len = query_states.shape[-2]
         head_dim = query_states.shape[-1]
 

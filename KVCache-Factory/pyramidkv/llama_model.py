@@ -350,6 +350,7 @@ def llama_flash_attn2_forward_PyramidKV(
     past_key_value: Optional[Cache] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     
@@ -396,8 +397,15 @@ def llama_flash_attn2_forward_PyramidKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    cos, sin = self.rotary_emb(value_states, position_ids)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    # cos, sin = self.rotary_emb(value_states, position_ids)
+    # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    
+    if position_embeddings is None:
+        cos, sin = self.rotary_emb(value_states, position_ids)
+    else:
+        cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    
     key_states, value_states = maybe_repeat_kv_before_cache(
         self.config, key_states, value_states, self.num_key_value_groups)
 
@@ -461,6 +469,10 @@ def llama_flash_attn2_forward_PyramidKV(
         query_states = query_states.to(target_dtype)
         key_states = key_states.to(target_dtype)
         value_states = value_states.to(target_dtype)
+
+    # add sync, equaling to HF flash-atten
+    if q_len == 1 and position_ids is not None:
+        _ = bool((torch.diff(position_ids, dim=-1) >= 0).all())
 
     attn_output = _flash_attention_forward(
         self, query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
@@ -1098,6 +1110,7 @@ def llama_flash_attn2_forward_CAM(
     past_key_value: Optional[Cache] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     # [SnapKV] register kv_cluster
@@ -1144,8 +1157,15 @@ def llama_flash_attn2_forward_CAM(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    cos, sin = self.rotary_emb(value_states, position_ids)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    # cos, sin = self.rotary_emb(value_states, position_ids)
+    # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+    if position_embeddings is None:
+        cos, sin = self.rotary_emb(value_states, position_ids)
+    else:
+        cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    
     # [SnapKV] move to ahead
     key_states, value_states = maybe_repeat_kv_before_cache(
         self.config, key_states, value_states, self.num_key_value_groups)
@@ -1196,6 +1216,10 @@ def llama_flash_attn2_forward_CAM(
         query_states = query_states.to(target_dtype)
         key_states = key_states.to(target_dtype)
         value_states = value_states.to(target_dtype)
+    
+    # add sync, equaling to HF flash-atten
+    if q_len == 1 and position_ids is not None:
+        _ = bool((torch.diff(position_ids, dim=-1) >= 0).all())
 
     attn_output = _flash_attention_forward(
         self, query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate
@@ -2183,6 +2207,7 @@ def llama_flash_attn2_forward_SnapKV(
     past_key_value: Optional[Cache] = None,
     output_attentions: bool = False,
     use_cache: bool = False,
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     # [SnapKV] register kv_cluster
@@ -2229,8 +2254,15 @@ def llama_flash_attn2_forward_SnapKV(
         else:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
-    cos, sin = self.rotary_emb(value_states, position_ids)
-    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+    # cos, sin = self.rotary_emb(value_states, position_ids)
+    # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+    if position_embeddings is None:
+        cos, sin = self.rotary_emb(value_states, position_ids)
+    else:
+        cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
     # [SnapKV] move to ahead
     key_states, value_states = maybe_repeat_kv_before_cache(
         self.config, key_states, value_states, self.num_key_value_groups)
@@ -2248,6 +2280,11 @@ def llama_flash_attn2_forward_SnapKV(
             self.kv_seq_len += q_len
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         past_key_value._seen_tokens=self.kv_seq_len
+    
+    # if self.layer_idx == 0 and q_len == 1:
+    #     print(past_key_value.get_seq_length(self.layer_idx),
+    #         key_states.shape[-2], self.kv_seq_len, type(past_key_value).__name__)
+    
     # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
     # to be able to avoid many of these transpose/reshape/view.
     
@@ -2284,6 +2321,10 @@ def llama_flash_attn2_forward_SnapKV(
         query_states = query_states.to(target_dtype)
         key_states = key_states.to(target_dtype)
         value_states = value_states.to(target_dtype)
+
+    # add sync, equaling to HF flash-atten
+    if q_len == 1 and position_ids is not None:
+        _ = bool((torch.diff(position_ids, dim=-1) >= 0).all())
 
     attn_output = _flash_attention_forward(
         self, query_states, key_states, value_states, attention_mask, q_len, dropout=dropout_rate

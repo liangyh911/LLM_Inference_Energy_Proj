@@ -79,7 +79,7 @@ class GPUFreqMonitor:
             pass
 
 class ZeusEnergyTracker(LogitsProcessor):
-    def __init__(self, monitor, power_monitor=None, measure_interval=1, gpu_id=0):
+    def __init__(self, monitor, power_monitor=None, measure_interval=64, gpu_id=0):
         self.monitor = monitor
         self.power_monitor = power_monitor
         self.gpu_id = gpu_id
@@ -234,8 +234,44 @@ class ZeusEnergyTracker(LogitsProcessor):
         else:
             return None, None
 
+    def get_avg_power(self, start_time, end_time, lookback=2.0):
+        # PowerMonitor 只在功率变化时记录样本 (去重)，样本算术平均会有偏差，
+        # 因此按阶梯函数做时间加权平均: avg = ∫P dt / (end - start)
+        if self.power_monitor is None or start_time is None or end_time is None:
+            return None
 
-datasets = ["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
+        timeline = self.power_monitor.get_power_timeline(
+            power_domain="device_instant",
+            gpu_index=self.gpu_id,
+            start_time=start_time - lookback,
+            end_time=end_time
+        ).get(self.gpu_id, [])
+
+        # 窗口起点的功率 = 起点之前最后一个样本的值 (去重后该值一直保持到下一个样本)
+        before = [s for s in timeline if s[0] <= start_time]
+        points = [(start_time, before[-1][1])] if before else []
+        points += [s for s in timeline if start_time < s[0] <= end_time]
+
+        if not points:
+            return None
+        duration = end_time - points[0][0]
+        if duration <= 0:
+            return points[0][1]
+
+        energy = 0.0
+        for (t0, p0), (t1, _) in zip(points, points[1:]):
+            energy += p0 * (t1 - t0)
+        energy += points[-1][1] * (end_time - points[-1][0])
+        return energy / duration
+
+    def get_prefill_avg_power(self):
+        return self.get_avg_power(self.prefill_start_time, self.prefill_end_time)
+
+    def get_decode_avg_power(self):
+        return self.get_avg_power(self.decode_start_time, self.decode_end_time)
+
+
+datasets =["narrativeqa", "qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "musique", \
             "gov_report", "qmsum", "multi_news", "trec", "triviaqa", "samsum", \
             "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
 
@@ -305,8 +341,8 @@ model2prompt = {
 model2maxlen = {
     "llama2": 3950,
     "llama-2": 3950,
-    "llama3": 512,
-    "llama-3": 512,
+    "llama3": 7500,
+    "llama-3": 7500,
     "mistral": 31500
 }
 
@@ -586,8 +622,8 @@ def main(args):
             extra_generation_kwargs["past_key_values"] = HeadwiseOffloadedCache()
         
         # 2. 实例化跟踪器
-        # tracker = ZeusEnergyTracker(monitor, power_monitor)
-        tracker = ZeusEnergyTracker(monitor)
+        # power_monitor 为 None 时 (--enable_power_monitor False) 不统计平均功率
+        tracker = ZeusEnergyTracker(monitor, power_monitor)
         processors = LogitsProcessorList([tracker])
 
         # 3. 开启 Prefill 能耗测量窗口
@@ -633,6 +669,7 @@ def main(args):
         else:
             # 极端异常情况：如果模型一个 token 都没生成直接退出
             measurement = monitor.end_window("prefill")
+            tracker.prefill_end_time = time.time()
             tracker.decode_end_time = time.time()
 
             tracker.prefill_energy = measurement.total_energy
@@ -641,24 +678,25 @@ def main(args):
             decode_time = 0.0
 
         # eval_batch_size is validated to be 1 at startup, so only sample 0 exists.
-        batch_generations = tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
+        # batch_generations = tokenizer.batch_decode([output[0][context_length:]], skip_special_tokens=True)
+        batch_generations = tokenizer.batch_decode([output[k][context_length:] for k in range(output.shape[0])], skip_special_tokens=True)
 
         torch.cuda.empty_cache()
 
         for j in range(args.eval_batch_size):
             example = {}
-
-            example["prompt"] = batch_prompts[0]
-            example["input"] = batch_inputs[0]
-            example["context"] = batch_contexts[0]
-            example["answers"] = batch_answerss[0]
-            example["pred"] = batch_generations[0]
-            example["length"] = batch_lengths[0]
-
-            example["dataset"] = batch_datasets[0]
-            example["language"] = batch_languages[0]
-            example["all_classes"] = batch_all_classess[0]
-            example["_id"] = batch__ids[0]
+            
+            example["prompt"] = batch_prompts[j]
+            example["input"] = batch_inputs[j]
+            example["context"] = batch_contexts[j]
+            example["answers"] = batch_answerss[j]
+            example["pred"] = batch_generations[j]
+            example["length"] = batch_lengths[j]
+            
+            example["dataset"] = batch_datasets[j]
+            example["language"] = batch_languages[j]
+            example["all_classes"] = batch_all_classess[j]
+            example["_id"] = batch__ids[j]
 
             fout.write(json.dumps(example) + "\n")
         
@@ -679,13 +717,16 @@ def main(args):
         tpj = num_gen_tokens / seq_decode_energy if seq_decode_energy > 0 else 0.0
         tps = num_gen_tokens / seq_decode_time if seq_decode_time > 0 else 0.0
 
-        # --- Maximum power for prefill and decode ---
-        
         example_energy["prefill_energy_J"] = seq_prefill_energy
         example_energy["prefill_time_s"] = seq_prefill_time
 
         example_energy["decode_energy_J"] = seq_decode_energy
         example_energy["decode_time_s"] = seq_decode_time
+
+        # --- Average power for prefill and decode (PowerMonitor) ---
+        if power_monitor is not None:
+            example_energy["prefill_avg_power_W"] = tracker.get_prefill_avg_power()
+            example_energy["decode_avg_power_W"] = tracker.get_decode_avg_power()
 
         # 记录具体的吞吐量与能效指标
         example_energy["input_tokens"] = num_tokens // args.eval_batch_size
@@ -753,6 +794,7 @@ if __name__ == "__main__":
     parser.add_argument('--head_beta', type=float, default=1.01, help='hyper-parameter used on HeadKV')
     parser.add_argument("--recent_size", type=int, default=32, help="")
     parser.add_argument("--pruning_ratio", type=float, default=0.4, help="pruning ratio of Key Cache")
+    parser.add_argument("--enable_power_monitor", type=str2bool, default=False, help="use zeus PowerMonitor to profile average power of prefill and decode.")
 
     parser.add_argument(
         "--use_chat_format", 
@@ -794,6 +836,9 @@ if __name__ == "__main__":
             raise ValueError(f"Unknown dataset(s) {invalid_datasets}; valid datasets: {datasets}")
     else:
         selected_datasets = list(datasets)
+
+    # PowerMonitor 会启动后台采样进程，只在开关打开时创建
+    power_monitor = PowerMonitor(gpu_indices=[0], power_domains=["device_instant"]) if args.enable_power_monitor else None
 
     set_seed(args.seed)
     patch_quantized_cache(args.quant_method)
@@ -851,3 +896,6 @@ if __name__ == "__main__":
         args.data_file = f"data/LongBench/{args.dataset}.jsonl"
 
         main(args)
+
+    if power_monitor is not None:
+        power_monitor.stop()
